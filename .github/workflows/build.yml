@@ -1,0 +1,18 @@
+# .github/workflows/build.yml
+name: Build Windows
+
+on: push
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+      - run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: screenshot_tool.exe
+          path: target/release/screenshot_tool.exe
