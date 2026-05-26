@@ -489,7 +489,7 @@ impl eframe::App for ScreenshotApp {
                                 *end = pos.clamp(canvas.min, canvas.max);
                             }
                         }
-                        if response.dragged_stopped_by(PointerButton::Primary) {
+                        if response.drag_stopped_by(PointerButton::Primary) {
                             *dragging = false;
                             let sel =
                                 Rect::from_min_max(start.min(*end), start.max(*end));
