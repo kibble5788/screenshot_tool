@@ -1283,7 +1283,7 @@ fn handle_canvas_interaction(
         }
     }
 
-    if resp.dragged_stopped_by(PointerButton::Primary) && *drawing {
+    if resp.drag_stopped_by(PointerButton::Primary) && *drawing {
         *drawing = false;
         let end = resp.interact_pointer_pos().unwrap_or(*draw_start);
 
@@ -1346,20 +1346,19 @@ fn handle_canvas_interaction(
 
 // ==================== 入口 ====================
 
-fn main() {
-    let app = ScreenshotApp::new();
-
+fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
-        viewport: ViewportBuilder::default()
-            .with_fullscreen(true)
-            .with_decorations(false)
-            .with_always_on_top(),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([800.0, 600.0]), // 或其他默认尺寸
         ..Default::default()
     };
 
-    let _ = eframe::run_native(
-        "截图工具 - Screenshot Tool",
+    let app = ScreenshotApp::new();
+    
+    eframe::run_native(
+        "截图工具",
         native_options,
-        Box::new(|_cc| Ok(Box::new(app))),
-    );
+        Box::new(|_cc| Box::new(app)), // 注意这里去掉了 Ok()
+    )
 }
+
