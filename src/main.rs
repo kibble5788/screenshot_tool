@@ -1,6 +1,6 @@
 //! 截图工具 - 支持区域截图、标注、钉住截图对比
 //! 编译: cargo build --release
-//! 输出: target/release/screenshot_tool.exe (免安装)
+//! 输出: target/release/screenshot_tool.exe (免安装)1
 
 use eframe::egui;
 use egui::*;
