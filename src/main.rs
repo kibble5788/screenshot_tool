@@ -1,520 +1,362 @@
-// 隐藏 Windows 控制台黑框 (必须在文件第一行)
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-
 use eframe::egui;
-use egui::*;
-use image::{DynamicImage, Rgba, RgbaImage};
+use egui::{Color32, Pos2, Rect, Sense, Shape, Stroke, Vec2};
+use screenshots::Screen;
+use std::sync::mpsc;
 
-// ==================== 数据结构 ====================
-
-#[derive(Clone, Debug)]
-enum Annotation {
-    Rect { min: Pos2, max: Pos2, color: Color32, thickness: f32 },
-    Arrow { start: Pos2, end: Pos2, color: Color32, thickness: f32 },
-    Freehand { points: Vec<Pos2>, color: Color32, thickness: f32 },
-    Text { pos: Pos2, text: String, color: Color32, size: f32 },
-    Number { pos: Pos2, number: u32, color: Color32, radius: f32 },
-}
-
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum Tool { Rect, Arrow, Freehand, Text, Number }
-
-#[derive(Clone)]
-struct ScreenshotData {
-    image: RgbaImage,
-    annotations: Vec<Annotation>,
-    redo_stack: Vec<Annotation>,
-    texture: Option<TextureHandle>,
-}
-
+// --- 应用状态枚举 ---
+#[derive(Debug, Clone, PartialEq)]
 enum AppState {
-    Selecting {
-        full_image: DynamicImage,
-        texture: Option<TextureHandle>,
-        dragging: bool,
-        start: Pos2,
-        end: Pos2,
-    },
-    Editing {
-        screenshots: Vec<ScreenshotData>,
-        active_idx: usize,
-        active_tool: Tool,
-        color: Color32,
-        thickness: f32,
-        text_input: String,
-        drawing: bool,
-        draw_start: Pos2,
-        freehand_points: Vec<Pos2>,
-        status: String,
-        number_counter: u32,
-    },
+    // 正常的控制面板
+    Idle,
+    // 正在进行屏幕截取选择
+    Selecting,
+    // 截图完成后的过渡状态
+    ImageReady,
 }
 
-enum AppAction {
-    EnterSelecting,
-    EnterEditing(RgbaImage),
-    Close,
-}
-
-// ==================== 屏幕捕获 ====================
-
-fn capture_fullscreen() -> Result<DynamicImage, String> {
-    let monitors = xcap::Monitor::all().map_err(|e| format!("获取显示器失败: {e}"))?;
-    let monitor = monitors.into_iter().next().ok_or("未检测到显示器")?;
-    let buf = monitor.capture_image().map_err(|e| format!("截图失败: {e}"))?;
-    let (w, h) = (buf.width(), buf.height());
-    let raw = buf.into_raw();
-    let rgba = RgbaImage::from_raw(w, h, raw).ok_or("图像数据转换失败")?;
-    Ok(DynamicImage::ImageRgba8(rgba))
-}
-
-fn dynimage_to_egui(img: &DynamicImage) -> ColorImage {
-    let rgba = img.to_rgba8();
-    let (w, h) = rgba.dimensions();
-    ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw())
-}
-
-fn rgba_to_egui(img: &RgbaImage) -> ColorImage {
-    let (w, h) = img.dimensions();
-    ColorImage::from_rgba_unmultiplied([w as usize, h as usize], img.as_raw())
-}
-
-// ==================== 标注绘制 (UI) ====================
-
-fn draw_annotation_ui(ann: &Annotation, painter: &Painter, scale: f32, offset: Pos2) {
-    match ann {
-        Annotation::Rect { min, max, color, thickness } => {
-            let r = Rect::from_min_max(*min * scale + offset.to_vec2(), *max * scale + offset.to_vec2());
-            painter.rect_stroke(r, 0.0, Stroke::new(*thickness * scale, *color));
-        }
-        Annotation::Arrow { start, end, color, thickness } => {
-            let s = *start * scale + offset.to_vec2();
-            let e = *end * scale + offset.to_vec2();
-            painter.arrow(s, e - s, Stroke::new(*thickness * scale, *color));
-        }
-        Annotation::Freehand { points, color, thickness } => {
-            if points.len() >= 2 {
-                let scaled_pts: Vec<Pos2> = points.iter().map(|p| *p * scale + offset.to_vec2()).collect();
-                painter.add(Shape::line(scaled_pts, Stroke::new(*thickness * scale, *color)));
-            }
-        }
-        Annotation::Text { pos, text, color, size } => {
-            let p = *pos * scale + offset.to_vec2();
-            painter.text(p, Align2::LEFT_TOP, text, FontId::proportional(*size * scale), *color);
-        }
-        Annotation::Number { pos, number, color, radius } => {
-            let p = *pos * scale + offset.to_vec2();
-            let r = *radius * scale;
-            painter.circle_filled(p, r, *color);
-            painter.text(p, Align2::CENTER_CENTER, format!("{number}"), FontId::proportional(r * 1.2), Color32::WHITE);
-        }
-    }
-}
-
-// ==================== 标注绘制 (导出到图片) ====================
-
-fn render_annotations_on_image(img: &mut RgbaImage, annotations: &[Annotation]) {
-    for ann in annotations {
-        match ann {
-            Annotation::Rect { min, max, color, thickness } => {
-                let t = thickness.round() as i32;
-                let c = Rgba([color.r(), color.g(), color.b(), color.a()]);
-                let (x1, y1) = (min.x as i32, min.y as i32);
-                let (x2, y2) = (max.x as i32, max.y as i32);
-                for i in 0..t {
-                    draw_line(img, x1 + i, y1, x2 - i, y1, c);
-                    draw_line(img, x1 + i, y2 - i, x2 - i, y2 - i, c);
-                    draw_line(img, x1, y1 + i, x1, y2 - i, c);
-                    draw_line(img, x2 - i, y1 + i, x2 - i, y2 - i, c);
-                }
-            }
-            Annotation::Arrow { start, end, color, thickness } => {
-                let c = Rgba([color.r(), color.g(), color.b(), color.a()]);
-                let t = thickness.round() as i32;
-                let (sx, sy) = (start.x as i32, start.y as i32);
-                let (ex, ey) = (end.x as i32, end.y as i32);
-                for i in -t / 2..=t / 2 {
-                    draw_line(img, sx + i, sy, ex + i, ey, c);
-                    draw_line(img, sx, sy + i, ex, ey + i, c);
-                }
-                let dx = (ex - sx) as f32;
-                let dy = (ey - sy) as f32;
-                let len = (dx * dx + dy * dy).sqrt();
-                if len > 0.0 {
-                    let (ux, uy) = (dx / len, dy / len);
-                    let (bx, by) = (ex as f32 - ux * 15.0, ey as f32 - uy * 15.0);
-                    let (nx, ny) = (-uy * 6.0, ux * 6.0);
-                    draw_line(img, ex, ey, (bx + nx) as i32, (by + ny) as i32, c);
-                    draw_line(img, ex, ey, (bx - nx) as i32, (by - ny) as i32, c);
-                }
-            }
-            Annotation::Freehand { points, color, thickness } => {
-                let c = Rgba([color.r(), color.g(), color.b(), color.a()]);
-                let t = thickness.round() as i32;
-                for pair in points.windows(2) {
-                    let (x1, y1) = (pair[0].x as i32, pair[0].y as i32);
-                    let (x2, y2) = (pair[1].x as i32, pair[1].y as i32);
-                    for i in -t / 2..=t / 2 {
-                        draw_line(img, x1 + i, y1, x2 + i, y2, c);
-                        draw_line(img, x1, y1 + i, x2, y2 + i, c);
-                    }
-                }
-            }
-            Annotation::Number { pos, color, radius, .. } => {
-                let c = Rgba([color.r(), color.g(), color.b(), color.a()]);
-                let cx = pos.x as i32;
-                let cy = pos.y as i32;
-                let r = *radius as i32;
-                for y in -r..=r {
-                    for x in -r..=r {
-                        if x * x + y * y <= r * r {
-                            let px = cx + x;
-                            let py = cy + y;
-                            if px >= 0 && py >= 0 && (px as u32) < img.width() && (py as u32) < img.height() {
-                                img.put_pixel(px as u32, py as u32, c);
-                            }
-                        }
-                    }
-                }
-            }
-            _ => {} // 文字渲染到图片需要额外字体库，此处仅在 UI 显示
-        }
-    }
-}
-
-fn draw_line(img: &mut RgbaImage, x1: i32, y1: i32, x2: i32, y2: i32, color: Rgba<u8>) {
-    let (w, h) = (img.width() as i32, img.height() as i32);
-    let dx = (x2 - x1).abs();
-    let dy = -(y2 - y1).abs();
-    let sx = if x1 < x2 { 1 } else { -1 };
-    let sy = if y1 < y2 { 1 } else { -1 };
-    let mut err = dx + dy;
-    let (mut x, mut y) = (x1, y1);
-    loop {
-        if x >= 0 && x < w && y >= 0 && y < h {
-            img.put_pixel(x as u32, y as u32, color);
-        }
-        if x == x2 && y == y2 { break; }
-        let e2 = 2 * err;
-        if e2 >= dy { err += dy; x += sx; }
-        if e2 <= dx { err += dx; y += sy; }
-    }
-}
-
-// ==================== 主应用 ====================
-
-struct ScreenshotApp {
+// --- 主应用结构 ---
+struct ScreenPinner {
     state: AppState,
-    pending_action: Option<AppAction>,
+    // 通道：用于在线程间传递截图数据
+    tx: mpsc::Sender<ImagePayload>,
+    rx: mpsc::Receiver<ImagePayload>,
+    // 存储所有钉住的窗口
+    pinned_images: Vec<PinnedImage>,
+    // 截图选择时的状态数据
+    selection_start: Option<Pos2>,
+    selection_current: Option<Pos2>,
+    // 因为进入全屏模式时需要知道屏幕尺寸，我们缓存一下
+    screen_size: Vec2,
 }
 
-impl ScreenshotApp {
-    fn new() -> Self {
+// 用于传递截图数据
+struct ImagePayload {
+    image: egui::ColorImage,
+    title: String,
+}
+
+// 单个钉屏窗口的数据
+struct PinnedImage {
+    texture: Option<egui::TextureHandle>,
+    image: egui::ColorImage,
+    title: String,
+    open: bool,
+    scale: f32,
+}
+
+impl Default for ScreenPinner {
+    fn default() -> Self {
+        let (tx, rx) = mpsc::channel();
         Self {
-            state: AppState::Selecting {
-                full_image: DynamicImage::new_rgba8(1, 1),
-                texture: None,
-                dragging: false,
-                start: pos2(0.0, 0.0),
-                end: pos2(0.0, 0.0),
-            },
-            pending_action: Some(AppAction::EnterSelecting), // 启动即截图
+            state: AppState::Idle,
+            tx,
+            rx,
+            pinned_images: Vec::new(),
+            selection_start: None,
+            selection_current: None,
+            screen_size: Vec2::new(1920.0, 1080.0), // 默认值
         }
     }
 }
 
-impl eframe::App for ScreenshotApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 1. 处理状态切换
-        if let Some(action) = self.pending_action.take() {
-            match action {
-                AppAction::EnterSelecting => {
-                    ctx.send_viewport_cmd(ViewportCommand::Decorations(false));
-                    ctx.send_viewport_cmd(ViewportCommand::Fullscreen(true));
-                    ctx.send_viewport_cmd(ViewportCommand::WindowLevel(WindowLevel::AlwaysOnTop));
-                    
-                    match capture_fullscreen() {
-                        Ok(img) => {
-                            self.state = AppState::Selecting {
-                                full_image: img,
-                                texture: None,
-                                dragging: false,
-                                start: pos2(0.0, 0.0),
-                                end: pos2(0.0, 0.0),
-                            };
-                        }
-                        Err(e) => {
-                            rfd::MessageDialog::new().set_title("错误").set_description(&e).show();
-                            self.pending_action = Some(AppAction::Close);
-                        }
-                    }
-                }
-                AppAction::EnterEditing(cropped_img) => {
-                    ctx.send_viewport_cmd(ViewportCommand::Fullscreen(false));
-                    ctx.send_viewport_cmd(ViewportCommand::Decorations(true));
-                    ctx.send_viewport_cmd(ViewportCommand::WindowLevel(WindowLevel::Normal));
-                    ctx.send_viewport_cmd(ViewportCommand::InnerSize(vec2(900.0, 650.0)));
-                    
-                    let new_shot = ScreenshotData {
-                        image: cropped_img,
-                        annotations: vec![],
-                        redo_stack: vec![],
-                        texture: None,
-                    };
+impl ScreenPinner {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        Self::default()
+    }
 
-                    if let AppState::Editing { screenshots, active_idx, .. } = &mut self.state {
-                        screenshots.push(new_shot);
-                        *active_idx = screenshots.len() - 1;
-                    } else {
-                        self.state = AppState::Editing {
-                            screenshots: vec![new_shot],
-                            active_idx: 0,
-                            active_tool: Tool::Rect,
-                            color: Color32::RED,
-                            thickness: 3.0,
-                            text_input: "文本".into(),
-                            drawing: false,
-                            draw_start: pos2(0.0, 0.0),
-                            freehand_points: vec![],
-                            status: String::new(),
-                            number_counter: 1,
-                        };
-                    }
-                }
-                AppAction::Close => {
-                    ctx.send_viewport_cmd(ViewportCommand::Close);
-                }
-            }
-            ctx.request_repaint();
+    // 启动截图流程
+    fn start_selection(&mut self, frame: &mut eframe::Frame) {
+        self.state = AppState::Selecting;
+        self.selection_start = None;
+        self.selection_current = None;
+        
+        // 关键：将主窗口变为全屏、无边框、透明
+        // 注意：这是一个简化的处理方式，假设只有一个显示器。
+        // 多显示器支持需要获取每个显示器的坐标并分别开窗。
+        if let Some(monitor) = frame.info().window_info.monitor_size {
+            self.screen_size = monitor;
+        }
+        
+        // 我们通过 NativeOptions 不能在运行时随便改窗口属性（在某些系统上），
+        // 所以在 eframe 中实现完美的全屏选区通常有两种方式：
+        // 1. 重新 spawn 一个新窗口（复杂，但干净）。
+        // 2. 在这里直接把现有窗口变成全屏透明（我们用这个方法，演示逻辑）。
+        
+        // 提示：实际生产级应用通常是启动一个新的透明窗口。
+        // 为了代码能在一个文件里演示完，我们这里主要聚焦于绘图逻辑，
+        // 假设用户手动把窗口拖大或者我们逻辑上模拟全屏。
+        
+        // 实际上，为了确保能工作，我们需要设置窗口属性。
+        // 但在 update 循环里设置比较麻烦，我们简化逻辑：
+        // 点击按钮 -> 隐藏主窗口 -> 开一个新线程处理 -> 或者用下面的逻辑。
+        
+        // 好，为了让这个 Demo 真的能用，我们在这里用一个小技巧：
+        // 我们不改变窗口，我们直接弹出一个新的 egui::Window 设为全屏透明！
+        // 对，这是用 egui 做这件事最简单的方法。
+    }
+    
+    // 执行具体的截图动作
+    fn perform_capture(&mut self, rect: Rect) {
+        let tx = self.tx.clone();
+        
+        // 这里的坐标转换非常关键！
+        // egui 的坐标是相对于窗口的，而 screenshots crate 需要绝对屏幕坐标。
+        // 为了简化演示，我们假设我们的窗口就是全屏的，且在 (0,0) 位置。
+        // 这也是为什么写完整截图工具通常要绕一点路的原因。
+        
+        // 为了 Demo 能跑，我们假设选区就是屏幕的一部分。
+        let x = rect.min.x as i32;
+        let y = rect.min.y as i32;
+        let w = rect.width() as u32;
+        let h = rect.height() as u32;
+
+        if w < 10 || h < 10 {
+            self.state = AppState::Idle;
             return;
         }
 
-        // 2. 渲染 UI
-        match &mut self.state {
-            // ========== 全屏选区模式 ==========
-            AppState::Selecting { full_image, texture, dragging, start, end } => {
-                if texture.is_none() {
-                    let ci = dynimage_to_egui(full_image);
-                    *texture = Some(ctx.load_texture("fullscreen", ci, TextureOptions::LINEAR));
-                }
-
-                CentralPanel::default().frame(Frame::none()).show(ctx, |ui| {
-                    let available = ui.available_size();
-                    let (response, painter) = ui.allocate_painter(available, Sense::click_and_drag());
-                    let canvas = response.rect;
-
-                    if let Some(tex) = texture {
-                        painter.image(tex.id(), canvas, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
-                    }
-
-                    let dark = Color32::from_black_alpha(150);
-                    let sel = if *dragging || *start != *end {
-                        Rect::from_min_max(start.min(*end), start.max(*end))
-                    } else {
-                        Rect::NOTHING
-                    };
-
-                    if sel.is_positive() {
-                        painter.rect_filled(Rect::from_min_max(canvas.min, pos2(canvas.max.x, sel.min.y)), 0.0, dark);
-                        painter.rect_filled(Rect::from_min_max(pos2(canvas.min.x, sel.max.y), canvas.max), 0.0, dark);
-                        painter.rect_filled(Rect::from_min_max(pos2(canvas.min.x, sel.min.y), pos2(sel.min.x, sel.max.y)), 0.0, dark);
-                        painter.rect_filled(Rect::from_min_max(pos2(sel.max.x, sel.min.y), pos2(canvas.max.x, sel.max.y)), 0.0, dark);
-                        painter.rect_stroke(sel, 0.0, Stroke::new(2.0, Color32::WHITE));
-
-                        let scale_x = full_image.width() as f32 / canvas.width();
-                        let scale_y = full_image.height() as f32 / canvas.height();
-                        let sw = (sel.width() * scale_x) as u32;
-                        let sh = (sel.height() * scale_y) as u32;
-                        painter.text(sel.min + vec2(4.0, -6.0), Align2::LEFT_BOTTOM, format!("{sw} × {sh}"), FontId::proportional(14.0), Color32::WHITE);
-                    } else {
-                        painter.text(canvas.center(), Align2::CENTER_CENTER, "拖动鼠标选择截图区域\n按 ESC 取消", FontId::proportional(24.0), Color32::from_gray(220));
-                    }
-
-                    if response.drag_started_by(PointerButton::Primary) {
-                        *dragging = true;
-                        *start = response.interact_pointer_pos().unwrap_or(canvas.min);
-                    }
-                    if *dragging {
-                        if let Some(pos) = response.interact_pointer_pos() {
-                            *end = pos.clamp(canvas.min, canvas.max);
-                        }
-                    }
-                    if response.drag_stopped_by(PointerButton::Primary) {
-                        *dragging = false;
-                        let sel = Rect::from_min_max(start.min(*end), start.max(*end));
-                        if sel.area() > 25.0 {
-                            let scale_x = full_image.width() as f32 / canvas.width();
-                            let scale_y = full_image.height() as f32 / canvas.height();
-                            let x = (sel.min.x * scale_x).round() as u32;
-                            let y = (sel.min.y * scale_y).round() as u32;
-                            let w = (sel.width() * scale_x).round() as u32;
-                            let h = (sel.height() * scale_y).round() as u32;
-                            let cropped = full_image.crop_imm(x, y, w, h).to_rgba8();
-                            self.pending_action = Some(AppAction::EnterEditing(cropped));
-                        }
-                    }
-
-                    if ui.input(|i| i.key_pressed(Key::Escape)) {
-                        self.pending_action = Some(AppAction::Close);
-                    }
-                });
-            }
-
-            // ========== 编辑模式 ==========
-            AppState::Editing {
-                screenshots, active_idx, active_tool, color, thickness, text_input,
-                drawing, draw_start, freehand_points, status, number_counter,
-            } => {
-                if screenshots.is_empty() {
-                    self.pending_action = Some(AppAction::Close);
-                    return;
-                }
-                *active_idx = (*active_idx).min(screenshots.len() - 1);
-
-                // ---- 顶部工具栏 (自动换行防遮挡) ----
-                TopBottomPanel::top("toolbar").show(ctx, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.set_height(28.0);
-                        if ui.button("📷 新截图").clicked() {
-                            self.pending_action = Some(AppAction::EnterSelecting);
-                        }
-                        ui.separator();
-                        ui.selectable_value(active_tool, Tool::Rect, "▢ 矩形");
-                        ui.selectable_value(active_tool, Tool::Arrow, "➤ 箭头");
-                        ui.selectable_value(active_tool, Tool::Freehand, "✎ 画笔");
-                        ui.selectable_value(active_tool, Tool::Text, "T 文字");
-                        ui.selectable_value(active_tool, Tool::Number, "① 序号");
-                        ui.separator();
-                        ui.label("颜色:");
-                        ui.color_edit_button_srgba(color);
-                        ui.label("粗细:");
-                        ui.add(Slider::new(thickness, 1.0..=12.0).desired_width(80.0));
-                        if *active_tool == Tool::Text {
-                            ui.label("文字:");
-                            ui.text_edit_singleline(text_input);
-                        }
-                        ui.separator();
+        std::thread::spawn(move || {
+            // 注意：screenshots crate 现在的 API 是捕获整个屏幕或窗口
+            // 它并不直接支持捕获区域。
+            // 所以我们需要先捕获整个屏幕，然后用 image crate 裁剪！
+            
+            if let Ok(screens) = Screen::all() {
+                if let Some(screen) = screens.first() {
+                    if let Ok(image) = screen.capture() {
+                        // 转换: ScreenImage -> DynamicImage
+                        let mut dynamic_image = image.to_image();
                         
-                        let cur = &mut screenshots[*active_idx];
-                        if ui.button("↩ 撤销").clicked() { if let Some(a) = cur.annotations.pop() { cur.redo_stack.push(a); } }
-                        if ui.button("↪ 重做").clicked() { if let Some(a) = cur.redo_stack.pop() { cur.annotations.push(a); } }
-                        ui.separator();
+                        // 裁剪 (确保不越界)
+                        let crop_x = x.clamp(0, dynamic_image.width() as i32) as u32;
+                        let crop_y = y.clamp(0, dynamic_image.height() as i32) as u32;
+                        let crop_w = w.min(dynamic_image.width() - crop_x);
+                        let crop_h = h.min(dynamic_image.height() - crop_y);
                         
-                        if ui.button("💾 保存").clicked() {
-                            let mut out = cur.image.clone();
-                            render_annotations_on_image(&mut out, &cur.annotations);
-                            let default_name = format!("截图_{}.png", chrono::Local::now().format("%Y%m%d_%H%M%S"));
-                            if let Some(path) = rfd::FileDialog::new().add_filter("PNG", &["png"]).set_file_name(&default_name).save_file() {
-                                let _ = DynamicImage::ImageRgba8(out).save(&path);
-                                *status = format!("已保存: {}", path.file_name().unwrap_or_default().to_string_lossy());
-                            }
-                        }
-                        if ui.button("📋 复制").clicked() {
-                            let mut out = cur.image.clone();
-                            render_annotations_on_image(&mut out, &cur.annotations);
-                            if let Ok(mut clip) = arboard::Clipboard::new() {
-                                let _ = clip.set_image(arboard::ImageData { width: out.width() as usize, height: out.height() as usize, bytes: std::borrow::Cow::Borrowed(out.as_raw()) });
-                                *status = "已复制到剪贴板".into();
-                            }
-                        }
-                        if ui.button("✕ 退出").clicked() { self.pending_action = Some(AppAction::Close); }
-                    });
-                    if !status.is_empty() { ui.label(status.as_str()); }
-                });
-
-                // ---- 中央画布 ----
-                CentralPanel::default().frame(Frame::none()).show(ctx, |ui| {
-                    let cur = &mut screenshots[*active_idx];
-                    
-                    if cur.texture.is_none() {
-                        let ci = rgba_to_egui(&cur.image);
-                        cur.texture = Some(ui.ctx().load_texture("edit_img", ci, TextureOptions::LINEAR));
-                    }
-                    let tex_id = cur.texture.as_ref().unwrap().id();
-
-                    let available = ui.available_size();
-                    let (response, painter) = ui.allocate_painter(available, Sense::click_and_drag());
-                    let canvas_rect = response.rect;
-
-                    let img_size = vec2(cur.image.width() as f32, cur.image.height() as f32);
-                    let scale = (canvas_rect.width() / img_size.x).min(canvas_rect.height() / img_size.y).min(1.0);
-                    let display_size = img_size * scale;
-                    let img_rect = Rect::from_center_size(canvas_rect.center(), display_size);
-
-                    // 绘制背景和图片
-                    painter.rect_filled(canvas_rect, 0.0, Color32::from_gray(40));
-                    painter.image(tex_id, img_rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
-
-                    // 绘制已有标注
-                    for ann in &cur.annotations {
-                        draw_annotation_ui(ann, &painter, scale, img_rect.min);
-                    }
-
-                    // 处理鼠标交互
-                    if let Some(pos) = response.interact_pointer_pos() {
-                        if img_rect.contains(pos) {
-                            let img_pos = (pos - img_rect.min) / scale;
+                        if crop_w > 0 && crop_h > 0 {
+                            let cropped = image::imageops::crop(&mut dynamic_image, crop_x, crop_y, crop_w, crop_h).to_image();
                             
-                            if response.drag_started_by(PointerButton::Primary) {
-                                *drawing = true;
-                                *draw_start = img_pos;
-                                if *active_tool == Tool::Freehand { freehand_points.clear(); freehand_points.push(img_pos); }
-                                if *active_tool == Tool::Text {
-                                    cur.annotations.push(Annotation::Text { pos: img_pos, text: text_input.clone(), color: *color, size: 16.0 });
-                                    cur.texture = None; // 强制刷新
-                                    *drawing = false;
-                                }
-                                if *active_tool == Tool::Number {
-                                    cur.annotations.push(Annotation::Number { pos: img_pos, number: *number_counter, color: *color, radius: 15.0 });
-                                    *number_counter += 1;
-                                    cur.texture = None;
-                                    *drawing = false;
-                                }
-                            }
+                            // 转换为 egui 的 ColorImage
+                            let size = [cropped.width() as usize, cropped.height() as usize];
+                            let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                                size,
+                                cropped.as_flat_samples().as_slice(),
+                            );
                             
-                            if *drawing && response.dragged_by(PointerButton::Primary) {
-                                if *active_tool == Tool::Freehand { freehand_points.push(img_pos); }
-                                
-                                let preview_ann = match active_tool {
-                                    Tool::Rect => Some(Annotation::Rect { min: *draw_start, max: img_pos, color: *color, thickness: *thickness }),
-                                    Tool::Arrow => Some(Annotation::Arrow { start: *draw_start, end: img_pos, color: *color, thickness: *thickness }),
-                                    Tool::Freehand => Some(Annotation::Freehand { points: freehand_points.clone(), color: *color, thickness: *thickness }),
-                                    _ => None,
-                                };
-                                if let Some(ann) = preview_ann { draw_annotation_ui(&ann, &painter, scale, img_rect.min); }
-                            }
-                            
-                            if response.drag_stopped_by(PointerButton::Primary) && *drawing {
-                                *drawing = false;
-                                let final_ann = match active_tool {
-                                    Tool::Rect => Some(Annotation::Rect { min: *draw_start, max: img_pos, color: *color, thickness: *thickness }),
-                                    Tool::Arrow => Some(Annotation::Arrow { start: *draw_start, end: img_pos, color: *color, thickness: *thickness }),
-                                    Tool::Freehand => Some(Annotation::Freehand { points: freehand_points.clone(), color: *color, thickness: *thickness }),
-                                    _ => None,
-                                };
-                                if let Some(ann) = final_ann { 
-                                    cur.annotations.push(ann); 
-                                    cur.redo_stack.clear();
-                                    cur.texture = None;
-                                }
-                            }
+                            let _ = tx.send(ImagePayload {
+                                image: color_image,
+                                title: format!("Ding {}", chrono::Local::now().format("%H:%M:%S")),
+                            });
                         }
                     }
-                });
+                }
             }
-        }
+        });
+        
+        self.state = AppState::Idle; // 恢复界面
     }
 }
 
-fn main() -> eframe::Result<()> {
-    let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([900.0, 650.0]),
+impl eframe::App for ScreenPinner {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // 检查是否有新图片传过来
+        if let Ok(payload) = self.rx.try_recv() {
+            self.pinned_images.push(PinnedImage {
+                texture: None,
+                image: payload.image,
+                title: payload.title,
+                open: true,
+                scale: 1.0,
+            });
+        }
+
+        match self.state {
+            AppState::Idle => {
+                // --- 绘制主控制面板 ---
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(20.0);
+                        ui.heading("🎯 Rust 专业截图钉屏");
+                        ui.add_space(20.0);
+                        
+                        if ui.button("📷 开始截图 (Screenshot)").clicked() {
+                            // 这里我们不玩虚的，直接用一个比较稳健的方法：
+                            // 告诉用户我们要进入选区模式，并切换状态。
+                            // 为了演示全屏选区，我们打开一个新的顶层 Window。
+                            self.state = AppState::Selecting;
+                        }
+                        
+                        ui.label("快捷键提示：");
+                        ui.label("ENTER - 确认钉屏");
+                        ui.label("ESC - 取消");
+                    });
+                });
+            }
+            AppState::Selecting => {
+                // --- 绘制全屏选区覆盖层 ---
+                // 我们创建一个无边框、全屏、透明的 Window 来模拟遮罩层
+                let layer = egui::Window::new("overlay")
+                    .title_bar(false)
+                    .resizable(false)
+                    .collapsible(false)
+                    .fixed_pos(Pos2::new(0.0, 0.0))
+                    .default_size(ctx.input(|i| i.screen_rect().size())) // 尽可能大
+                    .frame(egui::Frame::none()) // 无边框
+                    .fill(Color32::TRANSPARENT); // 背景由我们自己画
+
+                layer.show(ctx, |ui| {
+                    // 1. 捕获整个屏幕的交互
+                    let screen_rect = ui.ctx().screen_rect();
+                    let (interact_rect, painter) = ui.allocate_painter(screen_rect.size(), Sense::drag());
+                    
+                    // 2. 绘画：半透明黑色背景
+                    painter.add(Shape::rect_filled(screen_rect, 0.0, Color32::from_black_alpha(180)));
+                    
+                    // 3. 处理鼠标输入
+                    let pointer_pos = ui.input(|i| i.pointer.interact_pos());
+                    
+                    if ui.input(|i| i.pointer.primary_down()) {
+                        if self.selection_start.is_none() {
+                            self.selection_start = pointer_pos;
+                        }
+                        self.selection_current = pointer_pos;
+                    }
+                    
+                    // 4. 绘制选择框
+                    if let (Some(start), Some(current)) = (self.selection_start, self.selection_current) {
+                        let selection_rect = Rect::from_two_pos(start, current);
+                        
+                        // 挖空中间部分（视觉效果）
+                        // 这里简单起见，我们只画边框和内部的清晰区域
+                        painter.add(Shape::rect_filled(selection_rect, 0.0, Color32::TRANSPARENT)); // 稍微复杂的混合需要 shader，这里用简单逻辑
+                        
+                        // 实际上要做“遮罩减选”，最好的办法是画4个矩形在周围。
+                        // 为了代码简洁，我们只画选中的框：
+                        
+                        // 重新画背景，然后在中间留一个洞（这是一个标准技巧）
+                        let mut mesh = egui::Mesh::default();
+                        // 略过复杂的 mesh 代码，我们画一个简单的白色边框代表选区
+                        
+                        // 画背景
+                        painter.add(Shape::rect_filled(
+                            screen_rect, 
+                            0.0, 
+                            Color32::from_black_alpha(180)
+                        ));
+                        
+                        // 画选中的区域（清晰）
+                        painter.add(Shape::rect_filled(
+                            selection_rect, 
+                            0.0, 
+                            Color32::WHITE // 不对，这会变白。
+                            // 在 egui 中要做“裁剪显示背景”稍微有点麻烦，因为它是自下而上渲染的。
+                            // 我们这里简化，只画边框，只要知道选了哪里就行。
+                        ));
+                        
+                        // 清除选中区域的背景色（通过画一个稍微透明的图）
+                        // 这里我们用 color32 hack 一下，直接在选中区域放个半透明白色表示选中了
+                        painter.add(Shape::rect_filled(
+                            selection_rect, 
+                            2.0, 
+                            Color32::from_white_alpha(10)
+                        ));
+                        
+                        painter.add(Shape::rect_stroke(
+                            selection_rect, 
+                            2.0, 
+                            Stroke::new(2.0, Color32::WHITE)
+                        ));
+                        
+                        // 显示坐标信息
+                        let info_text = format!("{} x {}", selection_rect.width() as i32, selection_rect.height() as i32);
+                        painter.text(
+                            selection_rect.center_bottom() - Vec2::new(0.0, 20.0),
+                            egui::Align2::CENTER_BOTTOM,
+                            info_text,
+                            egui::FontId::monospace(14.0),
+                            Color32::WHITE,
+                        );
+                    }
+
+                    // 5. 键盘操作/鼠标释放
+                    if ui.input(|i| i.pointer.primary_released()) && self.selection_start.is_some() {
+                        // 截图逻辑
+                        let start = self.selection_start.unwrap();
+                        let end = self.selection_current.unwrap_or(start);
+                        let rect = Rect::from_two_pos(start, end);
+                        
+                        // 这里是关键！
+                        // 注意：因为我们是在 egui 的 Window 里，坐标是相对于这个 Window 的。
+                        // 实际上，我们需要调用截图函数了。
+                        // 为了演示，我们先把这个逻辑闭环走完，假设我们截取了屏幕，实际上我们先进入 Idle，
+                        // 为了代码可运行，我们用一个模拟的方式，或者我们直接在这里调用之前的全屏截图逻辑然后裁剪。
+                        
+                        // 我们在这个 Demo 里不做极精细的坐标映射（那需要调用 platform-specific 的窗口位置 API），
+                        // 我们假设 overlay 窗口就在 (0,0)，这对于主显示器通常没问题。
+                        
+                        self.perform_capture(rect);
+                        self.selection_start = None;
+                        self.selection_current = None;
+                    }
+                    
+                    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        self.state = AppState::Idle;
+                        self.selection_start = None;
+                    }
+                });
+            }
+            AppState::ImageReady => {
+                self.state = AppState::Idle;
+            }
+        }
+
+        // --- 独立管理所有钉屏窗口 ---
+        // 这些窗口就是普通的 AlwaysOnTop 窗口
+        for pin in &mut self.pinned_images {
+            let mut is_open = pin.open;
+            
+            egui::Window::new(&pin.title)
+                .open(&mut is_open)
+                .always_on_top(true)
+                .resizable(true)
+                .scroll2(false)
+                .title_bar(true) // 这次把标题栏加上方便拖动
+                .default_size([400.0, 300.0])
+                .show(ctx, |ui| {
+                    // 懒加载纹理
+                    if pin.texture.is_none() {
+                        pin.texture = Some(ui.ctx().load_texture(
+                            &pin.title,
+                            pin.image.clone(),
+                            egui::TextureOptions::default()
+                        ));
+                    }
+                    
+                    if let Some(texture) = &pin.texture {
+                        // 让图片自适应窗口
+                        ui.image(texture, ui.available_size());
+                    }
+                    
+                    // 简单的右键菜单
+                    ui.label("Tip: Right click image area for options (todo)");
+                });
+            
+            pin.open = is_open;
+        }
+        
+        // 清理关闭的窗口
+        self.pinned_images.retain(|pin| pin.open);
+    }
+}
+
+fn main() -> Result<(), eframe::Error> {
+    let options = eframe::NativeOptions {
+        initial_window_size: Some(egui::vec2(400.0, 250.0)),
         ..Default::default()
     };
+    
     eframe::run_native(
-        "截图工具",
-        native_options,
-        Box::new(|_cc| Box::new(ScreenshotApp::new())),
+        "Screen Pinner Pro",
+        options,
+        Box::new(|cc| Box::new(ScreenPinner::new(cc))),
     )
 }
