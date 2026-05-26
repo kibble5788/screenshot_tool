@@ -1,0 +1,25 @@
+[package]
+name = "screenshot_tool"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+xcap = "0.8"                # 跨平台屏幕捕获
+egui = "0.27"               # GUI 库
+egui-wgpu = "0.27"          # egui 的 wgpu 后端
+egui-winit = "0.27"         # egui 的 winit 集成
+winit = "0.29"              # 窗口创建
+wgpu = "0.19"               # 图形 API 抽象
+image = "0.24"              # 图像保存
+arboard = "3.3"             # 剪贴板操作
+rfd = "0.14"                # 原生文件对话框
+chrono = "0.4"              # 时间戳生成文件名
+
+# 可选：静态链接 MSVC 运行时
+[profile.release]
+opt-level = "s"
+lto = true
+
+# 如果需要自定义图标，添加：
+# [build-dependencies]
+# winres = "0.1"
